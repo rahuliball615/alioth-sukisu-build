@@ -1,0 +1,248 @@
+# Build alioth kernel + SukiSU-Ultra 4.x
+#
+# Repo: sirf yahi 2 file chahiye (.github/workflows/build.yml + patch-419.py)
+# Trigger: Actions -> "Build alioth kernel + SukiSU 4.x" -> Run workflow
+# Output: flashable AnyKernel3 zip (MIUI ya AOSP variant) + Image + kernel.config
+#
+# Device: POCO F3 / Mi 11X / Redmi K40 (alioth)
+
+name: Build alioth kernel + SukiSU 4.x
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Variant (miui ya aosp - galat variant = black screen!)"
+        type: choice
+        options:
+          - miui
+          - aosp
+        default: miui
+      kernel_repo:
+        description: "Kernel source repo (owner/name)"
+        type: string
+        default: "KopsourcesORG/KosminorKernel-Alioth"
+      kernel_ref:
+        description: "Kernel branch / tag / commit"
+        type: string
+        required: true
+        default: "hyper-2"
+      defconfig:
+        description: "defconfig target"
+        type: string
+        required: true
+        default: "alioth_kosminor_defconfig"
+      sukisu_ref:
+        description: "SukiSU ref (main = no SUSFS | builtin = with SUSFS)"
+        type: string
+        required: true
+        default: "main"
+      enable_kpm:
+        description: "Enable CONFIG_KPM"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Swap add karo (LTO link OOM bhagane ke liye)
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 8
+
+      - name: CI repo checkout (patch script ke liye)
+        uses: actions/checkout@v4
+
+      - name: Kernel source checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_ref }}
+          path: kernel
+          # Full history is needed because multi-branch setups fail with a
+          # shallow clone, and older stable kernels use shallow submodules that
+          # cannot be shallowened further.
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git automake build-essential bc flex bison \
+            libssl-dev liblz4-tool rsync zip unzip python3
+
+      - name: Purana KernelSU hatao (SukiSU aayega)
+        working-directory: kernel
+        run: |
+          rm -rf KernelSU
+          rm -f drivers/kernelsu
+          sed -i '/KernelSU/d' .gitmodules 2>/dev/null || true
+          echo "--- drivers/Makefile ksu lines:"; grep -n kernelsu drivers/Makefile || true
+          echo "--- drivers/Kconfig ksu lines:"; grep -n kernelsu drivers/Kconfig || true
+
+      - name: Toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            kernel/toolchain/llvm
+            kernel/toolchain/python2
+          key: alioth-toolchain-clang-standalone-v1
+
+      - name: Toolchain (clang-standalone + python2)
+        working-directory: kernel
+        run: |
+          [ -d toolchain/llvm ]   || git clone --depth 1 https://gitlab.com/ThankYouMario/android_prebuilts_clang-standalone.git toolchain/llvm
+          [ -d toolchain/python2 ] || git clone --depth 1 https://github.com/KopsourcesORG/python-2.7.18-prebuilt.git toolchain/python2
+          ./toolchain/llvm/bin/clang --version | head -n 1
+
+      - name: SukiSU ${{ inputs.sukisu_ref }} wire karo
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s "${{ inputs.sukisu_ref }}"
+          echo "--- symlink:"; ls -l drivers/kernelsu
+          echo "--- driver version:"; git -C KernelSU describe --tags --always
+
+      - name: defconfig me KSU options
+        working-directory: kernel
+        run: |
+          D="arch/arm64/configs/${{ inputs.defconfig }}"
+          # KPROBES + EXT4_FS = SukiSU ke hard dependencies
+          printf 'CONFIG_KSU=y\nCONFIG_KPROBES=y\nCONFIG_KSU_MANUAL_SU=y\nCONFIG_KALLSYMS=y\nCONFIG_KALLSYMS_ALL=y\n' >> "$D"
+          if [ "${{ inputs.enable_kpm }}" = "true" ]; then printf 'CONFIG_KPM=y\n' >> "$D"; fi
+          echo "=== defconfig tail ==="; tail -n 12 "$D"
+
+      - name: 4.19 compat patch (nofault / TWA_RESUME / MODULE_IMPORT_NS / SELinux)
+        run: python3 patch-419.py kernel
+
+      - name: AnyKernel3
+        run: |
+          git clone https://github.com/liyafe1997/AnyKernel3 -b kona --single-branch --depth=1 anykernel
+          echo "--- anykernel3 commit:"; git -C anykernel rev-parse --short HEAD
+
+      - name: Compile
+        working-directory: kernel
+        run: |
+          export ARCH=arm64 SUBARCH=arm64
+          export PATH="$PWD/toolchain/llvm/bin:$PWD/toolchain/python2/bin:$PATH"
+          export LD_LIBRARY_PATH="$PWD/toolchain/llvm/lib64:$PWD/toolchain/python2/lib:${LD_LIBRARY_PATH:-}"
+          export CC=clang LLVM=1 LLVM_IAS=1
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-android-
+          export LOCALVERSION=-sukisu4
+          export KBUILD_BUILD_HOST=Github-Action
+          export KBUILD_BUILD_USER=actions
+
+          make O=out "${{ inputs.defconfig }}"
+          make -j"$(nproc --all)" O=out prepare
+          # flask.h security/selinux build ke waqt banta hai, drivers/ pehle compile hota hai
+          make -j"$(nproc --all)" O=out security/selinux/
+          # Pehle sirf driver - 1-2 min me error pakda jaye
+          make -j"$(nproc --all)" O=out drivers/kernelsu/
+          make -j"$(nproc --all)" O=out
+
+      - name: Config verify (Kconfig did not drop anything)
+        working-directory: kernel
+        run: |
+          echo "=== critical ==="
+          grep -E '^CONFIG_(KSU|KPM|KPROBES|KRETPROBES|KALLSYMS|KALLSYMS_ALL|EXT4_FS)=' out/.config || true
+          grep -q '^CONFIG_KSU=y'     out/.config || { echo "::error::CONFIG_KSU missing - root cause is a missing dependency (KPROBES / EXT4_FS)"; exit 1; }
+          grep -q '^CONFIG_KPROBES=y' out/.config || { echo "::error::CONFIG_KPROBES missing"; exit 1; }
+          if [ "${{ inputs.enable_kpm }}" = "true" ]; then
+            grep -q '^CONFIG_KPM=y' out/.config \
+              || { echo "::error::inputs.enable_kpm=true but CONFIG_KPM is not set (KSU_KPM condition?)"; exit 1; }
+          fi
+
+      - name: KPM patch (only when KPM is enabled)
+        if: ${{ inputs.enable_kpm == 'true' }}
+        working-directory: kernel/out/arch/arm64/boot
+        run: |
+          wget -q https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.12.0/patch_linux
+          chmod +x patch_linux
+          ./patch_linux
+          rm -f Image
+          mv oImage Image
+          echo "KPM patched image ready"
+
+      # The config assertions above run before the KPM patch, which rewrites the
+      # image. Verify the patched output is still a sane, uncompressed arm64 Image.
+      - name: Post-patch sanity check
+        if: ${{ inputs.enable_kpm == 'true' }}
+        working-directory: kernel/out/arch/arm64/boot
+        run: |
+          test -s Image || { echo "::error::patched Image is missing or empty"; exit 1; }
+          if head -c 2 Image | grep -q '^\\x1f'; then
+            echo "::error::patched Image looks compressed; expected a raw arm64 Image"
+            exit 1
+          fi
+          ls -lh Image
+
+      - name: SUSFS verify (only for builtin ref)
+        if: ${{ inputs.sukisu_ref == 'builtin' }}
+        working-directory: kernel
+        run: |
+          grep -E '^CONFIG_(KSU_SUSFS|KSU_SUSFS_SUS_PATH|KSU_SUSFS_SUS_MOUNT)=' out/.config || true
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config \
+            || { echo "::error::sukisu_ref=builtin but CONFIG_KSU_SUSFS is not set - check setup.sh"; exit 1; }
+          strings out/arch/arm64/boot/Image | grep -qi susfs \
+            || { echo "::error::no SUSFS strings in Image - SUSFS did not link"; exit 1; }
+
+      - name: Flashable zip banao (AnyKernel3)
+        run: |
+          mkdir -p anykernel/kernels
+          cp kernel/out/arch/arm64/boot/Image anykernel/kernels/Image
+          # dtb optional - liyafe1997 ka build bhi dts se dtb banata hai par flash nahi karta
+          find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > anykernel/kernels/dtb 2>/dev/null || true
+
+          VARIANT=$(echo "${{ inputs.variant || 'miui' }}" | tr a-z A-Z)
+          TS=$(date +%Y%m%d_%H%M%S)
+          ZIP="Kernel_${VARIANT}_alioth_SukiSU4-${TS}_anykernel3.zip"
+
+          # AnyKernel3 needs the patched Image at anykernel/Image (its root),
+          # not under anykernel/kernels/ (which only ships mirror/ and firmware files).
+          install -m 644 kernel/out/arch/arm64/boot/Image anykernel/Image
+          if [ -s anykernel/kernels/dtb ]; then
+            install -m 644 anykernel/kernels/dtb anykernel/dtb
+          else
+            rm -f anykernel/dtb
+          fi
+          rm -f anykernel/kernels/Image anykernel/kernels/dtb
+
+          cd anykernel
+          zip -r9 "../$ZIP" ./* -x .git .gitignore out/ ./*.zip
+          cd ..
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          ls -lh "$ZIP"
+
+      - name: Image + config artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alioth-Image-sukisu4-${{ inputs.variant }}
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+          if-no-files-found: error
+
+      - name: Flashable zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alioth-flashable-${{ inputs.variant }}
+          path: ${{ env.ZIP }}
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          echo "### Build done" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Variant: **${{ inputs.variant }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Kernel ref: \`${{ inputs.kernel_ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SukiSU ref: \`${{ inputs.sukisu_ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- KPM: **${{ inputs.enable_kpm }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Flashable zip: \`$ZIP\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Test with \`fastboot boot\` first; do not flash directly.**" >> "$GITHUB_STEP_SUMMARY"
